@@ -28,6 +28,11 @@ static struct clk *clk;
 static u8 use_pm8941_xo_a2_192000;
 extern struct clk *fc8150_spi_get_clk(void);
 #endif
+
+#if defined(CONFIG_MACH_MSM8X10_W6DS_TIM_BR) || defined(CONFIG_MACH_MSM8X10_W6DS_GLOBAL_SCA)
+u8 module_init_flag;
+#endif
+
 u32 bbm_xtal_freq;
 
 ISDBT_INIT_INFO_T *hInit;
@@ -37,6 +42,7 @@ u32 totalErrTS=0;
 unsigned char ch_num = 0;
 
 u8 scan_mode;
+static u8 drv_open_state = 0;
 
 ISDBT_MODE driver_mode = ISDBT_POWEROFF;
 
@@ -54,6 +60,12 @@ static wait_queue_head_t isdbt_isr_wait;
 #define FC8150_NAME		"broadcast1"
 #define GPIO_ISDBT_IRQ 82
 
+#define IS_INVALID_ADDR_VALUE(x) unlikely((x) < (unsigned long)0xC0000000)
+static inline long __must_check IS_INVALID_ADDR(const void *ptr)
+{
+       return IS_INVALID_ADDR_VALUE((unsigned long)ptr);
+}
+
 int gpio_isdbt_pwr_en;
 int gpio_isdbt_rst;
 
@@ -61,32 +73,7 @@ static DEFINE_MUTEX(ringbuffer_lock);
 
 void isdbt_hw_setting(void)
 {
-#if defined(CONFIG_MACH_MSM8X10_W6DS_GLOBAL_SCA)
-	if (lge_get_board_revno() >= HW_REV_A)
-	{
-		gpio_isdbt_pwr_en = 100;
-		gpio_isdbt_rst = 92;
-	}
-#else
-	if (lge_get_board_revno() > HW_REV_A) 
-	{
-		gpio_isdbt_pwr_en = 100;
-		gpio_isdbt_rst = 92;
-	}
-	else if(lge_get_board_revno() == HW_REV_A)
-	{
-		gpio_isdbt_pwr_en = 93;
-		gpio_isdbt_rst = 92;
-	}
-	else 
-	{
-		gpio_isdbt_pwr_en = 57;
-		gpio_isdbt_rst = 56;	
-	}
-	PRINTF(hInit, "[1seg] lge_get_board_revno() : %d, HW_REV_A: %d", lge_get_board_revno(), HW_REV_A);
-#endif
-
-#if defined(CONFIG_MACH_MSM8X10_W6DS_TIM_BR)
+#if defined(CONFIG_MACH_MSM8X10_W6DS_TIM_BR) || defined(CONFIG_MACH_MSM8X10_W6DS_GLOBAL_SCA)
 	if (lge_get_board_revno() >= HW_REV_A)
 	{
 		gpio_isdbt_pwr_en = 100;
@@ -242,8 +229,8 @@ static irqreturn_t isdbt_irq(int irq, void *dev_id)
 
 int data_callback(u32 hDevice, u8 *data, int len)
 {
-	ISDBT_INIT_INFO_T *hInit;
-	struct list_head *temp;
+	ISDBT_INIT_INFO_T *hInit=NULL;
+	struct list_head *temp=NULL;
 	int i;
 
 	totalTS +=(len/188);
@@ -254,17 +241,32 @@ int data_callback(u32 hDevice, u8 *data, int len)
 			totalErrTS++;
 	}
 
+	mutex_lock(&ringbuffer_lock);
 	hInit = (ISDBT_INIT_INFO_T *)hDevice;
 
 	list_for_each(temp, &(hInit->hHead))
 	{
 		ISDBT_OPEN_INFO_T *hOpen;
 
+		if(IS_INVALID_ADDR(temp)||(temp==NULL)) 
+		{
+			PRINTF(0, "fc8150 data_callback : temp IS_INVALID_ADDR : %p", temp);
+			mutex_unlock(&ringbuffer_lock);
+			return 0;
+		}
+
 		hOpen = list_entry(temp, ISDBT_OPEN_INFO_T, hList);
 
+		if(IS_INVALID_ADDR(hOpen)||(hOpen==NULL)) 
+		{
+			PRINTF(0, "fc8150 data_callback : hOpen IS_INVALID_ADDR : %p", hOpen);
+			mutex_unlock(&ringbuffer_lock);
+			return 0;
+		}
+				
 		if(hOpen->isdbttype == TS_TYPE)
 		{
-			mutex_lock(&ringbuffer_lock);
+
 			if(fci_ringbuffer_free(&hOpen->RingBuffer) < len )
 			{
 				mutex_unlock(&ringbuffer_lock);
@@ -275,10 +277,10 @@ int data_callback(u32 hDevice, u8 *data, int len)
 			fci_ringbuffer_write(&hOpen->RingBuffer, data, len);
 			wake_up_interruptible(&(hOpen->RingBuffer.queue));
 
-			mutex_unlock(&ringbuffer_lock);
 		}
 	}
 
+	mutex_unlock(&ringbuffer_lock);
 	return 0;
 }
 
@@ -345,7 +347,11 @@ int isdbt_open (struct inode *inode, struct file *filp)
 	static u8 temp[RING_BUFFER_SIZE];
 	PRINTF(hInit, "isdbt open\n");
 
-	hOpen = (ISDBT_OPEN_INFO_T *)kmalloc(sizeof(ISDBT_OPEN_INFO_T), GFP_KERNEL);
+	if(drv_open_state == 0)
+	{
+		mutex_lock(&ringbuffer_lock);
+		
+		hOpen = (ISDBT_OPEN_INFO_T *)kmalloc(sizeof(ISDBT_OPEN_INFO_T), GFP_KERNEL);
 
 	//hOpen->buf = (u8 *)kmalloc(RING_BUFFER_SIZE, GFP_KERNEL);
 	hOpen->buf = temp;
@@ -363,7 +369,12 @@ int isdbt_open (struct inode *inode, struct file *filp)
 
 	fci_ringbuffer_init(&hOpen->RingBuffer, hOpen->buf, RING_BUFFER_SIZE);
 
-	filp->private_data = hOpen;
+		filp->private_data = hOpen;
+
+		drv_open_state = 1;
+
+		mutex_unlock(&ringbuffer_lock);
+	}
 
 	return 0;
 }
@@ -409,16 +420,25 @@ static  ssize_t ioctl_isdbt_read(ISDBT_OPEN_INFO_T *hOpen  ,void __user *arg)
 	struct broadcast_dmb_data_info __user* puserdata = (struct broadcast_dmb_data_info  __user*)arg;
 	int ret = -ENODEV;
 	size_t count;
+	char *buf;
+
+#if 0
 	DMB_BB_HEADER_TYPE dmb_header;
 	static int read_count = 0;
-	char *buf;
+#endif
 
 	s32 avail;
 	struct fci_ringbuffer *cibuf = &hOpen->RingBuffer;
 	ssize_t len, total_len = 0;
 
+#if 0
 	buf = puserdata->data_buf + sizeof(DMB_BB_HEADER_TYPE);
 	count = puserdata->data_buf_size - sizeof(DMB_BB_HEADER_TYPE);
+	count = (count/188)*188;
+#endif
+
+	buf = puserdata->data_buf;
+	count = puserdata->data_buf_size;
 	count = (count/188)*188;
 
     if (!cibuf->data || !count)
@@ -444,6 +464,7 @@ static  ssize_t ioctl_isdbt_read(ISDBT_OPEN_INFO_T *hOpen  ,void __user *arg)
 	total_len = fci_ringbuffer_read_user(cibuf, buf, len);
 	mutex_unlock(&ringbuffer_lock);
 
+#if 0
 	dmb_header.data_type = DMB_BB_DATA_TS;
 	dmb_header.size = (unsigned short)total_len;
 	dmb_header.subch_id = ch_num;//0xFF;
@@ -451,7 +472,14 @@ static  ssize_t ioctl_isdbt_read(ISDBT_OPEN_INFO_T *hOpen  ,void __user *arg)
 
 	ret = copy_to_user(puserdata->data_buf, &dmb_header, sizeof(DMB_BB_HEADER_TYPE));
 
-	puserdata->copied_size = total_len + sizeof(DMB_BB_HEADER_TYPE);
+	puserdata->copied_size = total_len; //+ sizeof(DMB_BB_HEADER_TYPE);
+#endif
+
+	if (total_len > 0) {
+		puserdata->copied_size = total_len;
+		puserdata->packet_cnt = total_len / 188;
+		ret = BBM_OK;
+	}
 
 	return ret;
 }
@@ -460,14 +488,27 @@ int isdbt_release (struct inode *inode, struct file *filp)
 {
 	ISDBT_OPEN_INFO_T *hOpen;
 
-	hOpen = filp->private_data;
+	if(drv_open_state == 1)
+	{
+		mutex_lock(&ringbuffer_lock);
+
+		PRINTF(0, "isdbt_release Start!!!\n");
+
+		hOpen = filp->private_data;
 
 	hOpen->isdbttype = 0;
 
 	list_del(&(hOpen->hList));
 
-//	kfree(hOpen->buf);
-	kfree(hOpen);
+	//	kfree(hOpen->buf);
+		kfree(hOpen);
+
+		filp->private_data = 0;
+
+		drv_open_state = 0;
+
+		mutex_unlock(&ringbuffer_lock);
+	}
 
 	return 0;
 }
@@ -814,9 +855,9 @@ long isdbt_ioctl (struct file *filp, unsigned int cmd, unsigned long arg)
 				else
 				{
 				#ifdef CONFIG_LGE_BROADCAST_BRAZIL_FREQ					
-					f_rf = (udata.ch_num- 14) * 6000 + 473143;
+					f_rf = (udata.channel- 14) * 6000 + 473143;
 				#else
-					f_rf = (udata.ch_num- 13) * 6000 + 473143;
+					f_rf = (udata.channel- 13) * 6000 + 473143;
 				#endif			
 					//PRINTF(0, "IOCTL_ISDBT_SET_FREQ freq:%d, RF:%d\n",udata.ch_num,f_rf);
 					if(udata.mode == LGE_BROADCAST_OPMODE_ENSQUERY)
@@ -842,7 +883,7 @@ long isdbt_ioctl (struct file *filp, unsigned int cmd, unsigned long arg)
 					// PRINTF(0, "IOCTL_ISDBT_SET_FREQ \n");
 					totalTS=0;
 					totalErrTS=0;
-					ch_num = udata.ch_num;
+					ch_num = udata.channel;
 					mutex_lock(&ringbuffer_lock);
 					fci_ringbuffer_flush(&hOpen->RingBuffer);
 					mutex_unlock(&ringbuffer_lock);
@@ -921,7 +962,74 @@ long isdbt_ioctl (struct file *filp, unsigned int cmd, unsigned long arg)
 
 int isdbt_init(void)
 {
-	s32 res;
+	s32 res = 0;
+
+	//20140121_yoonkil.kim Code for chip_id separation [START]
+#if defined(CONFIG_MACH_MSM8X10_W6DS_TIM_BR) || defined(CONFIG_MACH_MSM8X10_W6DS_GLOBAL_SCA)
+	u16 ver = 0;
+
+	if(lge_get_board_revno() > HW_REV_B){
+		PRINTF(hInit, "1SEG fc8150 Not support in MSM8610_W6DS_GLOBAL_SCA Rev.C... board\n");
+		return res;
+	}
+	else{
+		isdbt_hw_setting();
+		hInit = (ISDBT_INIT_INFO_T *)kmalloc(sizeof(ISDBT_INIT_INFO_T), GFP_KERNEL);
+
+		res = BBM_HOSTIF_SELECT(hInit, BBM_SPI);
+
+		if(res)
+		{
+			PRINTF(hInit, "isdbt host interface select fail!\n");
+		}
+
+		isdbt_hw_init();
+
+		res = bbm_word_read(hInit, BBM_CHIP_ID_L, &ver);
+
+		PRINTF(hInit, "[1seg] CHIP_ID_read Result : %d, ver : 0x%x \n", res, ver);
+
+		if((res==BBM_E_BB_READ)||(ver!=0x8150)) {
+			PRINTF(hInit, "[1seg] FC8150 Initialize Fail\n");
+			BBM_HOSTIF_DESELECT(hInit);
+			isdbt_hw_deinit();
+			kfree(hInit);
+			module_init_flag = FALSE;
+			return 0;
+		}
+
+		isdbt_hw_deinit();
+
+		PRINTF(hInit, "isdbt_init DRV V1p12 20130701\n");
+
+		res = misc_register(&fc8150_misc_device);
+
+		if(res)
+		{
+			PRINTF(hInit, "isdbt init fail : %d\n", res);
+			return res;
+		}
+
+		wake_lock_init(&oneseg_wakelock, WAKE_LOCK_SUSPEND, fc8150_misc_device.name);
+
+		if (!isdbt_kthread)
+		{
+			PRINTF(hInit, "kthread run\n");
+			isdbt_kthread = kthread_run(isdbt_thread, (void*)hInit, "isdbt_thread");
+		}
+
+		res = request_irq(gpio_to_irq(GPIO_ISDBT_IRQ), isdbt_irq, IRQF_DISABLED | IRQF_TRIGGER_FALLING, FC8150_NAME, NULL);
+
+		if(res)
+			PRINTF(hInit, "dmb rquest irq fail : %d\n", res);
+
+		INIT_LIST_HEAD(&(hInit->hHead));
+		module_init_flag = TRUE;
+
+		return 0;
+	}
+	//20140121_yoonkil.kim Code for chip_id separation [END]
+#else
 
 	PRINTF(hInit, "isdbt_init DRV V1p12 20130701\n");
 
@@ -959,7 +1067,9 @@ int isdbt_init(void)
 
 	INIT_LIST_HEAD(&(hInit->hHead));
 
+	drv_open_state = 0;
 	return 0;
+#endif
 }
 
 void isdbt_exit(void)

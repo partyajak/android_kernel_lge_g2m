@@ -10,6 +10,7 @@ typedef enum {
 	HW_REV_B,
 	HW_REV_B2,
 	HW_REV_C,
+	HW_REV_D,
 	HW_REV_1_0,
 	HW_REV_1_1,
 	HW_REV_MAX

@@ -190,11 +190,10 @@
 };
 
 &slim_msm {
-	tapan_codec {
-			qcom,cdc-micbias1-ext-cap;
+    tapan_codec {
+        qcom,cdc-micbias1-ext-cap;
 	};
-};
-
+    };
 &mdss_fb0 {
 	qcom,memory-reservation-size = <0x400000>; /* LGE chagne to decrease buffer size. QCT original -> 0x800000 */
 };
